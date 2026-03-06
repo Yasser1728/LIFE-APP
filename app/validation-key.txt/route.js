@@ -1,14 +1,17 @@
 import { NextResponse } from "next/server";
 
 export async function GET() {
+  const network = process.env.NEXT_PUBLIC_PI_NETWORK;
+
   const key =
-    "abf141d56af7e553f2d188b1582bd87600ff7016c64dc3c276c55ca67bcefd814ed250041ad1d2a5c4b8767cd1fa90acb7e2096661f819e5bf663c5020ce29fd";
+    network === "mainnet"
+      ? "119dda367c6c82820d9455e4aa3ba3a74f48280a6e85613751f1619340b86db50250a462b267fd55bb5d6e75f3f4ea58082a5a0d46a3b5c0b1b6d25dd3b7f7c1"
+      : "abf141d56af7e553f2d188b1582bd87600ff7016c64dc3c276c55ca67bcefd814ed250041ad1d2a5c4b8767cd1fa90acb7e2096661f819e5bf663c5020ce29fd";
 
   return new NextResponse(key, {
-    status: 200,
     headers: {
       "Content-Type": "text/plain",
-      "Cache-Control": "no-cache, no-store, must-revalidate",
+      "Cache-Control": "no-store",
     },
   });
 }
