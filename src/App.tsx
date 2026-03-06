@@ -5,6 +5,7 @@ function App() {
   const { user, authenticate, createPayment } = usePiNetwork();
   const [loading, setLoading] = useState(false);
   const [message, setMessage] = useState('');
+  const [a2uLoading, setA2ULoading] = useState(false);
 
   const handleAuth = async () => {
     try {
@@ -16,6 +17,39 @@ function App() {
       setMessage('Failed to authenticate.');
     } finally {
       setLoading(false);
+    }
+  };
+
+  const handleA2UPayment = async () => {
+    if (!user?.uid) return;
+
+    try {
+      setA2ULoading(true);
+      setMessage('Initiating App-to-User payment (0.1 Test-Pi)...');
+
+      const response = await fetch('/api/pay-test-user', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          uid: user.uid,
+          network: 'testnet',
+        }),
+      });
+
+      const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(data.error || 'Payment failed');
+      }
+
+      setMessage(`Success! 0.1 Test-Pi sent to your wallet. Payment ID: ${data.payment?.identifier ?? 'N/A'}`);
+    } catch (error: unknown) {
+      console.error(error);
+      setMessage(`Error: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    } finally {
+      setA2ULoading(false);
     }
   };
 
@@ -62,10 +96,17 @@ function App() {
             </div>
             <button 
               onClick={handlePayment}
-              disabled={loading}
+              disabled={loading || a2uLoading}
               className="bg-green-500 hover:bg-green-600 disabled:bg-green-300 text-white font-bold py-2 px-4 rounded-lg w-full transition-colors"
             >
               {loading ? 'Processing...' : 'Pay 1 Pi (Test)'}
+            </button>
+            <button
+              onClick={handleA2UPayment}
+              disabled={a2uLoading || loading}
+              className="mt-4 bg-blue-500 hover:bg-blue-600 disabled:bg-blue-300 text-white font-bold py-2 px-4 rounded-lg w-full transition-colors"
+            >
+              {a2uLoading ? 'Sending Pi...' : 'Receive 0.1 Test-Pi (A2U)'}
             </button>
           </>
         )}
