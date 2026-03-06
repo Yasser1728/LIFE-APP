@@ -1,7 +1,12 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import axios from 'axios';
-import { getPiConfig, getAuthHeaders } from './utils/pi-config.js';
-import { getPayment, updatePaymentStatus } from './utils/payment-db.js';
+
+const PI_BASE_URL = 'https://api.minepi.com/v2';
+
+/** In-memory store — resets on cold start. Best-effort guard within a
+ *  single function instance; the Pi Network API enforces payment state
+ *  machine on its side (approved → completed). */
+const paymentStore = new Map<string, { status: string; network: string; txid?: string }>();
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method !== 'POST') {
@@ -19,45 +24,41 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return res.status(400).json({ error: 'Missing or invalid txid' });
     }
 
-    // Resolve API key based on the requested network
-    let config;
-    try {
-      config = getPiConfig(network);
-    } catch (err: any) {
-      console.error('Pi config error:', err.message);
-      return res.status(500).json({ error: err.message });
-    }
-
-    const { apiKey, baseUrl } = config;
-
-    // Verify the payment was previously approved (exists in the DB)
-    const record = getPayment(paymentId);
-    if (!record) {
+    if (network !== 'pi_testnet' && network !== 'pi_mainnet') {
       return res
-        .status(404)
-        .json({ error: 'Payment not found — approve it first' });
+        .status(400)
+        .json({ error: `Invalid network "${network}". Must be "pi_testnet" or "pi_mainnet".` });
     }
-    if (record.status === 'completed') {
+
+    const apiKey =
+      network === 'pi_mainnet'
+        ? process.env.PI_API_KEY_MAINNET
+        : process.env.PI_API_KEY_TESTNET;
+
+    if (!apiKey) {
+      console.error(`[complete-payment] Missing API key for ${network}`);
+      return res.status(500).json({ error: `API key not configured for ${network}` });
+    }
+
+    // Double-spend guard: block if already completed within this instance.
+    // Note: the Pi Network API also enforces the approved→completed state
+    // transition server-side and will reject invalid attempts.
+    const existing = paymentStore.get(paymentId);
+    if (existing?.status === 'completed') {
       return res
         .status(409)
         .json({ error: 'Payment already completed (double-spend prevention)' });
     }
-    if (record.status !== 'approved') {
-      return res
-        .status(409)
-        .json({ error: 'Payment must be approved before it can be completed' });
-    }
 
-    // 1. Send completion request to Pi Network using the txid
+    // Send completion request to Pi Network using the txid
     await axios.post(
-      `${baseUrl}/payments/${paymentId}/complete`,
+      `${PI_BASE_URL}/payments/${paymentId}/complete`,
       { txid },
-      { headers: getAuthHeaders(apiKey) }
+      { headers: { Authorization: `Key ${apiKey}` } }
     );
 
-    // 2. Mark payment as completed in the database and deliver product/service
-    updatePaymentStatus(paymentId, 'completed', txid);
-    console.log(`Payment ${paymentId} completed. Deliver product here!`);
+    paymentStore.set(paymentId, { status: 'completed', network, txid });
+    console.log(`[complete-payment] Payment ${paymentId} completed. txid=${txid}`);
 
     return res.status(200).json({ message: 'Payment completed successfully' });
   } catch (error: any) {

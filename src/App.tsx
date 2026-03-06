@@ -34,7 +34,7 @@ function App() {
         },
         body: JSON.stringify({
           uid: user.uid,
-          network: 'testnet',
+          network: 'pi_testnet',
         }),
       });
 

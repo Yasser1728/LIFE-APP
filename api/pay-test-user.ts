@@ -14,23 +14,22 @@
  *   }
  *
  * Security: all sensitive keys are read from environment variables only.
- * The app wallet seed phrase is read from PI_APP_WALLET_SEED and is never
- * exposed in API responses.
  */
 
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import axios from 'axios';
-import { getPiConfig, getAuthHeaders } from './utils/pi-config.js';
-import {
-  hasPayment,
-  savePayment,
-  updatePaymentStatus,
-} from './utils/payment-db.js';
+
+const PI_BASE_URL = 'https://api.minepi.com/v2';
 
 /** Milliseconds to wait between blockchain confirmation poll attempts. */
 const POLL_INTERVAL_MS = 3_000;
 /** Maximum number of poll attempts before returning a 202 Accepted. */
 const MAX_POLL_ATTEMPTS = 10;
+
+/** In-memory store — resets on cold start. Best-effort guard within a
+ *  single function instance; the Pi Network API enforces payment state
+ *  machine on its side. */
+const paymentStore = new Map<string, { status: string; network: string; uid?: string; txid?: string }>();
 
 export default async function handler(
   req: VercelRequest,
@@ -49,22 +48,29 @@ export default async function handler(
       .json({ error: 'Missing or invalid uid (Pi user identifier)' });
   }
 
-  // Resolve network config — returns 500 if the env var is missing
-  let config;
-  try {
-    config = getPiConfig(network);
-  } catch (err: any) {
-    console.error('Pi config error:', err.message);
-    return res.status(500).json({ error: err.message });
+  // Validate network
+  if (network !== 'pi_testnet' && network !== 'pi_mainnet') {
+    return res
+      .status(400)
+      .json({ error: `Invalid network "${network}". Must be "pi_testnet" or "pi_mainnet".` });
   }
 
-  const { apiKey, baseUrl } = config;
-  const headers = getAuthHeaders(apiKey);
+  const apiKey =
+    network === 'pi_mainnet'
+      ? process.env.PI_API_KEY_MAINNET
+      : process.env.PI_API_KEY_TESTNET;
+
+  if (!apiKey) {
+    console.error(`[pay-test-user] Missing API key for ${network}`);
+    return res.status(500).json({ error: `API key not configured for ${network}` });
+  }
+
+  const headers = { Authorization: `Key ${apiKey}` };
 
   try {
     // ── Step 1: Create the App-to-User payment ────────────────────────────
     const createRes = await axios.post(
-      `${baseUrl}/payments`,
+      `${PI_BASE_URL}/payments`,
       {
         amount: 0.1,
         memo: 'LIFE-APP reward payment',
@@ -80,21 +86,21 @@ export default async function handler(
     }
 
     // ── Double-spend guard ────────────────────────────────────────────────
-    if (hasPayment(paymentId)) {
+    if (paymentStore.has(paymentId)) {
       return res.status(409).json({
         error: 'Payment already processed (double-spend prevention)',
         paymentId,
       });
     }
-    savePayment(paymentId, network, uid);
+    paymentStore.set(paymentId, { status: 'pending', network, uid });
 
     // ── Step 2: Approve the payment ───────────────────────────────────────
     await axios.post(
-      `${baseUrl}/payments/${paymentId}/approve`,
+      `${PI_BASE_URL}/payments/${paymentId}/approve`,
       {},
       { headers }
     );
-    updatePaymentStatus(paymentId, 'approved');
+    paymentStore.set(paymentId, { status: 'approved', network, uid });
 
     // ── Step 3: Poll for blockchain confirmation (txid) ───────────────────
     // Pi Network submits the transaction to the blockchain asynchronously.
@@ -102,7 +108,7 @@ export default async function handler(
     let txid: string | null = null;
     for (let _attempt = 0; _attempt < MAX_POLL_ATTEMPTS; _attempt++) {
       const statusRes = await axios.get(
-        `${baseUrl}/payments/${paymentId}`,
+        `${PI_BASE_URL}/payments/${paymentId}`,
         { headers }
       );
       if (statusRes.data?.transaction?.txid) {
@@ -129,11 +135,11 @@ export default async function handler(
 
     // ── Step 4: Complete the payment ──────────────────────────────────────
     await axios.post(
-      `${baseUrl}/payments/${paymentId}/complete`,
+      `${PI_BASE_URL}/payments/${paymentId}/complete`,
       { txid },
       { headers }
     );
-    updatePaymentStatus(paymentId, 'completed', txid);
+    paymentStore.set(paymentId, { status: 'completed', network, uid, txid });
 
     console.log(
       `[pay-test-user] Payment ${paymentId} completed. txid=${txid}`
