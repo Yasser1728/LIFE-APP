@@ -65,6 +65,15 @@ export default async function handler(
     return res.status(500).json({ error: `API key not configured for ${network}` });
   }
 
+  const walletSeed = process.env.PI_APP_WALLET_SEED;
+  if (!walletSeed) {
+    console.error('[pay-test-user] Missing PI_APP_WALLET_SEED environment variable');
+    return res.status(500).json({ error: 'App wallet seed not configured' });
+  }
+  // walletSeed is required for Stellar transaction signing when submitting
+  // payments directly to the Pi blockchain. Validated here to fail fast
+  // before initiating a payment that would otherwise be stuck in approved state.
+
   const headers = { Authorization: `Key ${apiKey}` };
 
   try {

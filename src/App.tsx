@@ -44,7 +44,7 @@ function App() {
         throw new Error(data.error || 'Payment failed');
       }
 
-      setMessage(`Success! 0.1 Test-Pi sent to your wallet. Payment ID: ${data.payment?.identifier ?? 'N/A'}`);
+      setMessage(`${data.message} Payment ID: ${data.paymentId ?? 'N/A'}`);
     } catch (error: unknown) {
       console.error(error);
       setMessage(`Error: ${error instanceof Error ? error.message : 'Unknown error'}`);
@@ -103,7 +103,7 @@ function App() {
             </button>
             <button
               onClick={handleA2UPayment}
-              disabled={a2uLoading || loading}
+              disabled={a2uLoading || loading || !user.uid}
               className="mt-4 bg-blue-500 hover:bg-blue-600 disabled:bg-blue-300 text-white font-bold py-2 px-4 rounded-lg w-full transition-colors"
             >
               {a2uLoading ? 'Sending Pi...' : 'Receive 0.1 Test-Pi (A2U)'}
