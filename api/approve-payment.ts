@@ -1,5 +1,7 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import axios from 'axios';
+import { getPiConfig, getAuthHeaders } from './utils/pi-config';
+import { savePayment, updatePaymentStatus, hasPayment } from './utils/payment-db';
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method !== 'POST') {
@@ -7,28 +9,40 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   }
 
   try {
-    const { paymentId } = req.body;
-    const PI_API_KEY = process.env.PI_API_KEY;
+    const { paymentId, network = 'pi_testnet' } = req.body ?? {};
 
     if (!paymentId || typeof paymentId !== 'string') {
       return res.status(400).json({ error: 'Missing or invalid paymentId' });
     }
 
-    if (!PI_API_KEY) {
-      console.error('PI_API_KEY environment variable is not configured');
-      return res.status(500).json({ error: 'Server configuration error' });
+    // Resolve API key based on the requested network
+    let config;
+    try {
+      config = getPiConfig(network);
+    } catch (err: any) {
+      console.error('Pi config error:', err.message);
+      return res.status(500).json({ error: err.message });
     }
+
+    const { apiKey, baseUrl } = config;
+
+    // Guard against double-approving the same payment
+    if (hasPayment(paymentId)) {
+      return res
+        .status(409)
+        .json({ error: 'Payment already tracked (double-spend prevention)' });
+    }
+    savePayment(paymentId, network);
 
     // 1. Send approval request to Pi Network
     await axios.post(
-      `https://api.minepi.com/v2/payments/${paymentId}/approve`,
+      `${baseUrl}/payments/${paymentId}/approve`,
       {},
-      {
-        headers: { Authorization: `Key ${PI_API_KEY}` }
-      }
+      { headers: getAuthHeaders(apiKey) }
     );
 
-    // NOTE: Save payment state to your database here
+    // 2. Mark payment as approved in the database
+    updatePaymentStatus(paymentId, 'approved');
 
     return res.status(200).json({ message: 'Payment approved successfully' });
   } catch (error: any) {

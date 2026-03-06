@@ -1,5 +1,7 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import axios from 'axios';
+import { getPiConfig, getAuthHeaders } from './utils/pi-config';
+import { getPayment, updatePaymentStatus } from './utils/payment-db';
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method !== 'POST') {
@@ -7,8 +9,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   }
 
   try {
-    const { paymentId, txid } = req.body;
-    const PI_API_KEY = process.env.PI_API_KEY;
+    const { paymentId, txid, network = 'pi_testnet' } = req.body ?? {};
 
     if (!paymentId || typeof paymentId !== 'string') {
       return res.status(400).json({ error: 'Missing or invalid paymentId' });
@@ -18,22 +19,45 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return res.status(400).json({ error: 'Missing or invalid txid' });
     }
 
-    if (!PI_API_KEY) {
-      console.error('PI_API_KEY environment variable is not configured');
-      return res.status(500).json({ error: 'Server configuration error' });
+    // Resolve API key based on the requested network
+    let config;
+    try {
+      config = getPiConfig(network);
+    } catch (err: any) {
+      console.error('Pi config error:', err.message);
+      return res.status(500).json({ error: err.message });
+    }
+
+    const { apiKey, baseUrl } = config;
+
+    // Verify the payment was previously approved (exists in the DB)
+    const record = getPayment(paymentId);
+    if (!record) {
+      return res
+        .status(404)
+        .json({ error: 'Payment not found — approve it first' });
+    }
+    if (record.status === 'completed') {
+      return res
+        .status(409)
+        .json({ error: 'Payment already completed (double-spend prevention)' });
+    }
+    if (record.status !== 'approved') {
+      return res
+        .status(409)
+        .json({ error: 'Payment must be approved before it can be completed' });
     }
 
     // 1. Send completion request to Pi Network using the txid
     await axios.post(
-      `https://api.minepi.com/v2/payments/${paymentId}/complete`,
+      `${baseUrl}/payments/${paymentId}/complete`,
       { txid },
-      {
-        headers: { Authorization: `Key ${PI_API_KEY}` }
-      }
+      { headers: getAuthHeaders(apiKey) }
     );
 
-    // 2. Update your database to confirm delivery
-    console.log('Payment completed securely. Deliver product here!');
+    // 2. Mark payment as completed in the database and deliver product/service
+    updatePaymentStatus(paymentId, 'completed', txid);
+    console.log(`Payment ${paymentId} completed. Deliver product here!`);
 
     return res.status(200).json({ message: 'Payment completed successfully' });
   } catch (error: any) {
