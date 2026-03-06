@@ -8,7 +8,7 @@ A production-ready template for building Pi Network applications using React, Vi
 - **UI**: Styled with Tailwind CSS.
 - **Backend**: Secure Vercel Serverless Functions (`/api/approve-payment` & `/api/complete-payment`).
 - **Pi SDK**: Integrated with the latest Pi SDK v2.
-- **Domain Verification**: Pre-configured `public/validation-key.txt` for easy domain approval.
+- **Domain Verification**: `public/validation-key.txt` contains both Testnet and Mainnet keys so a single deployment satisfies both Pi app verifications simultaneously.
 
 ## 🛠️ Setup & Deployment (Vercel)
 This project is designed to be deployed directly to Vercel in less than 2 minutes.
@@ -23,7 +23,7 @@ This project is designed to be deployed directly to Vercel in less than 2 minute
 Once deployed on Vercel, copy your new domain (e.g., `https://your-app.vercel.app`) and configure your Pi App:
 - **App URL**: `https://your-app.vercel.app`
 - **Backend URL**: `https://your-app.vercel.app`
-- Click **Verify Domain** (the validation key is already hosted!).
+- Click **Verify Domain** for **both** your Testnet app and your Mainnet app — the hosted `validation-key.txt` contains both keys so each Pi verification bot finds the string it expects.
 
 ## 💻 Local Development
 To run the project locally:
