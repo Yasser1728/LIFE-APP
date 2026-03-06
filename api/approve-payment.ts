@@ -1,7 +1,7 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import axios from 'axios';
-import { getPiConfig, getAuthHeaders } from './utils/pi-config';
-import { savePayment, updatePaymentStatus, hasPayment } from './utils/payment-db';
+import { getPiConfig, getAuthHeaders } from './utils/pi-config.js';
+import { savePayment, updatePaymentStatus, hasPayment } from './utils/payment-db.js';
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method !== 'POST') {

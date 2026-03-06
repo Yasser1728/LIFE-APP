@@ -20,12 +20,12 @@
 
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import axios from 'axios';
-import { getPiConfig, getAuthHeaders } from './utils/pi-config';
+import { getPiConfig, getAuthHeaders } from './utils/pi-config.js';
 import {
   hasPayment,
   savePayment,
   updatePaymentStatus,
-} from './utils/payment-db';
+} from './utils/payment-db.js';
 
 /** Milliseconds to wait between blockchain confirmation poll attempts. */
 const POLL_INTERVAL_MS = 3_000;
