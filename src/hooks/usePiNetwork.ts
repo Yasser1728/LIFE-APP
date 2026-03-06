@@ -6,7 +6,7 @@ export const usePiNetwork = () => {
 
   const authenticate = async () => {
     try {
-      const scopes = ['username', 'payments'];
+      const scopes = ['payments', 'username'];
       const onIncompletePaymentFound = async (payment: any) => {
         console.log('Incomplete payment found:', payment);
         // Call the Vercel API directly
