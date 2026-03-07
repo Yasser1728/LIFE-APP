@@ -8,24 +8,29 @@ A production-ready template for building Pi Network applications using React, Vi
 
 - **Frontend**: React + Vite + TypeScript
 - **UI**: Styled with Tailwind CSS
-- **Backend**: Secure Vercel Serverless Functions (`/api/pay-test-user` & `/api/complete-payment`)
-- **Pi SDK**: Integrated with the latest Pi SDK v2
-- **A2U Payments**: App-to-User payment flow fully implemented
-- **Domain Verification**: `public/validation-key.txt` contains both Testnet and Mainnet keys so a single deployment satisfies both Pi app verifications simultaneously
+- **Backend**: Vercel Serverless Functions
+- **Pi SDK**: Integrated with Pi SDK v2
+- **A2U Payments**: Full App-to-User payment flow using Stellar SDK directly
+- **Testnet & Mainnet**: Controlled via environment variables
+- **Domain Verification**: `public/validation-key.txt` contains both Testnet and Mainnet keys
 
 ## 📁 Project Structure
 
 ```
 LIFE-APP/
 ├── api/
-│   ├── pay-test-user.ts       # A2U payment: create → submit → complete
-│   └── complete-payment.ts    # Completes an incomplete/pending payment
+│   ├── pay-test-user.ts       # A2U payment: create → build → sign → submit → complete
+│   ├── approve-payment.ts     # Approves a U2A payment
+│   └── complete-payment.ts    # Completes a pending/incomplete payment
 ├── src/
-│   └── components/
-│       └── PiPayment.jsx      # Pi payment UI component
+│   ├── components/
+│   │   └── PiPayment.jsx      # Pi payment UI component
+│   └── hooks/
+│       └── usePiNetwork.ts    # Pi SDK authentication & payment hook
 ├── public/
 │   └── validation-key.txt     # Pi domain verification keys
 ├── .env.example               # Environment variables template
+├── package.json               # Dependencies including stellar-sdk
 └── vercel.json                # Vercel configuration
 ```
 
@@ -35,34 +40,49 @@ LIFE-APP/
 Go to [Vercel](https://vercel.com/) and import this GitHub repository.
 
 ### 2. Environment Variables
-During the Vercel setup, open the **Environment Variables** section and add:
+Add the following in Vercel → **Settings** → **Environment Variables**:
 
-| Variable | Description |
-|---|---|
-| `PI_NETWORK` | `testnet` or `mainnet` |
-| `PI_API_KEY_TESTNET` | API key from Pi Developer Portal (Testnet app) |
-| `PI_API_KEY_MAINNET` | API key from Pi Developer Portal (Mainnet app) |
-| `PI_APP_WALLET_SEED` | Secret seed starting with `S` from your Pi wallet |
+| Variable | Production | Preview/Dev | Description |
+|---|---|---|---|
+| `PI_NETWORK` | `mainnet` | `testnet` | Active network |
+| `PI_API_KEY_TESTNET` | ✅ | ✅ | API key from Pi Developer Portal (Testnet) |
+| `PI_API_KEY_MAINNET` | ✅ | ✅ | API key from Pi Developer Portal (Mainnet) |
+| `PI_APP_WALLET_SEED_TESTNET` | ✅ | ✅ | Testnet wallet seed starting with `S` |
+| `PI_APP_WALLET_SEED_MAINNET` | ✅ | — | Mainnet wallet seed (after Pi approves wallet) |
+| `VITE_PI_SANDBOX` | `false` | `true` | Controls Pi SDK sandbox mode |
 
-> ⚠️ **Never commit your real `.env` values to GitHub.**
+> ⚠️ **Never commit real `.env` values to GitHub.**
 
 ### 3. Deploy
-Click the **Deploy** button. Done!
+Click the **Deploy** button. Vercel will automatically install all dependencies including `stellar-sdk`.
 
 ## 🔌 Pi Developer Portal Configuration
 
-Once deployed on Vercel, copy your new domain (e.g., `https://your-app.vercel.app`) and configure your Pi App:
+Once deployed on Vercel, copy your domain (e.g., `https://your-app.vercel.app`) and configure:
 
 - **App URL**: `https://your-app.vercel.app`
 - **Backend URL**: `https://your-app.vercel.app`
-- Click **Verify Domain** for **both** your Testnet app and your Mainnet app — the hosted `validation-key.txt` contains both keys so each Pi verification bot finds the string it expects.
+- Click **Verify Domain** for both Testnet and Mainnet apps
+
+## 💳 A2U Payment Flow
+
+The `pay-test-user.ts` follows the official Pi Network integration guide:
+
+```
+STEP 1 → POST /v2/payments          → get paymentId + recipientAddress
+STEP 2 → loadAccount                → Stellar SDK (always load fresh)
+STEP 3 → buildTransaction           → networkPassphrase = "Pi Testnet" or "Pi Network"
+STEP 4 → signTransaction            → sign with wallet seed
+STEP 5 → submitTransaction          → get txid from Pi blockchain
+STEP 6 → POST /v2/payments/complete → finalize with paymentId + txid
+```
 
 ## 🔗 API Endpoints
 
 ### `POST /api/pay-test-user`
-Initiates a full A2U (App-to-User) payment flow.
+Initiates a full A2U payment flow.
 
-**Request body:**
+**Request:**
 ```json
 { "uid": "user_pi_uid_here" }
 ```
@@ -72,10 +92,27 @@ Initiates a full A2U (App-to-User) payment flow.
 { "success": true, "txid": "...", "paymentId": "..." }
 ```
 
-### `POST /api/complete-payment`
-Completes a pending/incomplete payment detected during authentication.
+---
 
-**Request body:**
+### `POST /api/approve-payment`
+Approves a U2A payment (called by Pi SDK `onReadyForServerApproval`).
+
+**Request:**
+```json
+{ "paymentId": "..." }
+```
+
+**Response:**
+```json
+{ "success": true, "message": "Payment approved successfully." }
+```
+
+---
+
+### `POST /api/complete-payment`
+Completes a pending or incomplete payment.
+
+**Request:**
 ```json
 { "paymentId": "...", "txid": "..." }
 ```
@@ -92,11 +129,21 @@ npm install
 npm run dev
 ```
 
-> **Note:** For the Pi SDK to work properly, test the app via the Pi Browser pointing to your live Vercel URL.
+> **Note:** Pi SDK only works inside the Pi Browser. Test using your live Vercel URL.
 
 ## 🔒 Security Notes
 
-- Rate limiting is applied to all API endpoints (in-memory — replace with [Upstash Redis](https://upstash.com/) in production)
-- Double-spend protection is enforced both in-memory and by the Pi Network API
-- API keys are selected automatically based on `PI_NETWORK` environment variable
-- Error details are only exposed in `development` mode
+- Rate limiting on all endpoints (in-memory — replace with [Upstash Redis](https://upstash.com/) in production)
+- Double-spend protection enforced in-memory and by Pi Network API
+- API key and wallet seed selected automatically based on `PI_NETWORK`
+- Error details only exposed in `development` mode
+- Wallet seed never exposed to frontend
+
+## 📦 Dependencies
+
+| Package | Purpose |
+|---|---|
+| `stellar-sdk` | Build, sign, and submit Pi blockchain transactions |
+| `axios` | HTTP requests to Pi API |
+| `react` + `vite` | Frontend framework and build tool |
+| `@vercel/node` | Vercel Serverless Functions types |
