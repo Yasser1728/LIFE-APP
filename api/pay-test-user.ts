@@ -159,7 +159,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     // STEP 2 - Load app wallet account from Pi blockchain
     // Always load fresh - account could have changed
     // --------------------------------------------------------
-    const server = new StellarSdk.Server(STELLAR_HORIZON, { allowHttp: false });
+    const server = new StellarSdk.Horizon.Server(STELLAR_HORIZON, { allowHttp: false });
     const keypair = StellarSdk.Keypair.fromSecret(WALLET_SEED);
     const myPublicKey = keypair.publicKey();
 
