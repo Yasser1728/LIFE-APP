@@ -1,21 +1,26 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
-import axios from 'axios';
+const PiNetwork = require('@pinetwork-js/api-backend');
 
 // ============================================================
 // CONFIG
 // ============================================================
-const PI_BASE_URL = 'https://api.minepi.com/v2';
 const IS_MAINNET = process.env.PI_NETWORK === 'mainnet';
-const NETWORK = IS_MAINNET ? 'pi_mainnet' : 'pi_testnet';
+
+const PAYMENT_CONFIG = {
+  amount: 0.1,
+  memo: 'A2U Testnet Completion',
+  metadata: { type: 'checklist_10_10' },
+  network: IS_MAINNET ? 'mainnet' : 'pi_testnet',
+};
 
 // ============================================================
 // KNOWN PI ERROR MESSAGES
 // ============================================================
 const PI_ERROR_MESSAGES: Record<string, string> = {
-  payment_not_found: 'Payment not found on the Pi Network.',
-  payment_already_completed: 'This payment has already been completed.',
-  invalid_txid: 'The provided transaction ID is invalid.',
-  unauthorized: 'API key is invalid or unauthorized.',
+  user_not_found: 'User not found on the Pi Network.',
+  insufficient_funds: 'Wallet has insufficient funds.',
+  payment_already_exists: 'This payment has already been processed.',
+  invalid_uid: 'Invalid user identifier.',
   network_error: 'Network error, please try again.',
 };
 
@@ -24,14 +29,14 @@ const PI_ERROR_MESSAGES: Record<string, string> = {
 // ============================================================
 const rateLimitMap = new Map<string, { count: number; startTime: number }>();
 const RATE_LIMIT_WINDOW_MS = 60 * 1000; // 1 minute
-const RATE_LIMIT_MAX_REQUESTS = 5;       // 5 requests per paymentId
+const RATE_LIMIT_MAX_REQUESTS = 3;       // 3 requests per UID
 
-function isRateLimited(key: string): boolean {
+function isRateLimited(uid: string): boolean {
   const now = Date.now();
-  const record = rateLimitMap.get(key);
+  const record = rateLimitMap.get(uid);
 
   if (!record || now - record.startTime > RATE_LIMIT_WINDOW_MS) {
-    rateLimitMap.set(key, { count: 1, startTime: now });
+    rateLimitMap.set(uid, { count: 1, startTime: now });
     return false;
   }
 
@@ -42,54 +47,61 @@ function isRateLimited(key: string): boolean {
 }
 
 // ============================================================
-// IN-MEMORY DOUBLE-SPEND GUARD
-// Note: resets on cold start. Pi Network API also enforces
-// the approved → completed state machine on its side.
-// Replace with a DB check in Production for full protection.
+// INIT PI SDK - Once on module load
 // ============================================================
-const paymentStore = new Map<string, { status: string; txid: string }>();
+let pi: any;
+try {
+  if (!process.env.PI_APP_WALLET_SEED) {
+    throw new Error('PI_APP_WALLET_SEED is missing from .env');
+  }
+  if (IS_MAINNET && !process.env.PI_API_KEY_MAINNET) {
+    throw new Error('PI_API_KEY_MAINNET is missing from .env');
+  }
+  if (!IS_MAINNET && !process.env.PI_API_KEY_TESTNET) {
+    throw new Error('PI_API_KEY_TESTNET is missing from .env');
+  }
+
+  pi = new PiNetwork(
+    IS_MAINNET ? process.env.PI_API_KEY_MAINNET : process.env.PI_API_KEY_TESTNET,
+    process.env.PI_APP_WALLET_SEED,
+    IS_MAINNET ? 'mainnet' : 'pi_testnet'
+  );
+
+  console.log(`[Pi SDK] Initialized on ${PAYMENT_CONFIG.network}`);
+} catch (initError: any) {
+  console.error('[Pi SDK] Initialization failed:', initError.message);
+}
 
 // ============================================================
 // HELPER - Resolve a friendly error message
 // ============================================================
 function resolveErrorMessage(error: any): string {
-  const piError = error.response?.data?.error_code || error.response?.data?.message || '';
   const errorKey = Object.keys(PI_ERROR_MESSAGES).find(
     (key) =>
-      piError?.toLowerCase().includes(key.toLowerCase()) ||
+      error?.code === key ||
       error?.message?.toLowerCase().includes(key.toLowerCase())
   );
   return errorKey
     ? PI_ERROR_MESSAGES[errorKey]
-    : error.response?.data?.message || error.message || 'An unexpected error occurred.';
+    : error?.message || 'An unexpected error occurred.';
 }
 
 // ============================================================
 // HELPER - Log transaction (replace with DB call in Production)
 // ============================================================
-function logTransaction(data: {
-  paymentId: string;
-  txid: string;
+async function logTransaction(data: {
+  uid: string;
+  paymentId: string | null;
+  txid: string | null;
   status: string;
   error?: string;
-}): void {
-  // Example: await db.transactions.upsert({ paymentId: data.paymentId, ...data });
+}): Promise<void> {
+  // Example: await db.transactions.create({ ...data, createdAt: new Date() });
   console.log('[Transaction Log]', {
     ...data,
-    network: NETWORK,
+    network: PAYMENT_CONFIG.network,
     timestamp: new Date().toISOString(),
   });
-}
-
-// ============================================================
-// VALIDATE API KEY ON STARTUP
-// ============================================================
-const API_KEY = IS_MAINNET ? process.env.PI_API_KEY_MAINNET : process.env.PI_API_KEY_TESTNET;
-
-if (!API_KEY) {
-  console.error(
-    `[complete-payment] Missing ${IS_MAINNET ? 'PI_API_KEY_MAINNET' : 'PI_API_KEY_TESTNET'} in .env`
-  );
 }
 
 // ============================================================
@@ -101,79 +113,82 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return res.status(405).json({ error: 'Method Not Allowed' });
   }
 
-  // 2. API key guard
-  if (!API_KEY) {
-    return res.status(500).json({ error: 'API key not configured for this network.' });
+  // 2. SDK guard
+  if (!pi) {
+    return res.status(500).json({ error: 'Pi SDK is not initialized.' });
   }
 
-  // 3. Parse & validate body
-  const { paymentId, txid } = req.body ?? {};
+  // 3. Validate UID
+  const { uid } = req.body ?? {};
 
-  if (!paymentId || typeof paymentId !== 'string' || paymentId.trim() === '') {
-    return res.status(400).json({ error: 'Missing or invalid paymentId.' });
+  if (!uid || typeof uid !== 'string' || uid.trim() === '') {
+    console.error('[Backend] Error: UID is missing or invalid.');
+    return res.status(400).json({ error: 'invalid_uid', message: 'User UID is required.' });
   }
 
-  if (!txid || typeof txid !== 'string' || txid.trim() === '') {
-    return res.status(400).json({ error: 'Missing or invalid txid.' });
-  }
-
-  const sanitizedPaymentId = paymentId.trim();
-  const sanitizedTxid = txid.trim();
+  const sanitizedUid = uid.trim();
 
   // 4. Rate limiting
-  if (isRateLimited(sanitizedPaymentId)) {
-    console.warn(`[complete-payment] Rate limit exceeded for paymentId: ${sanitizedPaymentId}`);
+  if (isRateLimited(sanitizedUid)) {
+    console.warn(`[Backend] Rate limit exceeded for UID: ${sanitizedUid}`);
     return res.status(429).json({
-      error: 'Too many requests. Please wait a minute and try again.',
+      error: 'rate_limit_exceeded',
+      message: 'Too many requests. Please wait a minute and try again.',
     });
   }
 
-  // 5. Double-spend guard (in-memory)
-  const existing = paymentStore.get(sanitizedPaymentId);
-  if (existing?.status === 'completed') {
-    console.warn(`[complete-payment] Double-spend attempt for paymentId: ${sanitizedPaymentId}`);
-    return res.status(409).json({
-      error: 'Payment already completed (double-spend prevention).',
-      txid: existing.txid,
-    });
-  }
+  let paymentId: string | null = null;
 
   try {
-    console.log(`[complete-payment] Completing paymentId: ${sanitizedPaymentId} | txid: ${sanitizedTxid}`);
+    console.log(`[Backend] Initiating A2U payment for UID: ${sanitizedUid}`);
 
-    // 6. Send completion request to Pi Network
-    await axios.post(
-      `${PI_BASE_URL}/payments/${sanitizedPaymentId}/complete`,
-      { txid: sanitizedTxid },
-      { headers: { Authorization: `Key ${API_KEY}` } }
-    );
+    // 5. Create the payment
+    paymentId = await pi.createPayment({
+      amount: PAYMENT_CONFIG.amount,
+      memo: PAYMENT_CONFIG.memo,
+      metadata: PAYMENT_CONFIG.metadata,
+      uid: sanitizedUid,
+    });
 
-    // 7. Update store & log
-    paymentStore.set(sanitizedPaymentId, { status: 'completed', txid: sanitizedTxid });
-    logTransaction({ paymentId: sanitizedPaymentId, txid: sanitizedTxid, status: 'completed' });
+    if (!paymentId) throw new Error('Payment creation failed. No paymentId received.');
+    console.log(`[Backend] Payment created. PaymentID: ${paymentId}`);
+
+    // 6. Submit to blockchain
+    const txid: string = await pi.submitPayment(paymentId);
+    if (!txid) throw new Error('Payment submission failed. No TXID received.');
+    console.log(`[Backend] Payment submitted to blockchain. TXID: ${txid}`);
+
+    // 7. Complete payment on Pi servers
+    await pi.completePayment(paymentId, txid);
+    console.log(`[Backend] Payment completed successfully. TXID: ${txid}`);
+
+    // 8. Log successful transaction
+    await logTransaction({ uid: sanitizedUid, paymentId, txid, status: 'completed' });
 
     return res.status(200).json({
       success: true,
+      txid,
+      paymentId,
       message: 'Payment completed successfully.',
-      txid: sanitizedTxid,
     });
 
   } catch (error: any) {
-    const statusCode = error.response?.status ?? 500;
-    const friendlyMessage = resolveErrorMessage(error);
+    console.error(`[Backend] Error processing payment for UID ${sanitizedUid}:`, error.message);
 
-    console.error('[complete-payment] Error:', error.response?.data || error.message);
-    logTransaction({
-      paymentId: sanitizedPaymentId,
-      txid: sanitizedTxid,
+    await logTransaction({
+      uid: sanitizedUid,
+      paymentId,
+      txid: null,
       status: 'failed',
       error: error.message,
     });
 
-    return res.status(statusCode).json({
-      error: 'Failed to complete payment.',
+    const friendlyMessage = resolveErrorMessage(error);
+
+    return res.status(500).json({
+      error: 'payment_failed',
       message: friendlyMessage,
-      ...(process.env.NODE_ENV === 'development' && { debug: error.response?.data || error.message }),
+      ...(process.env.NODE_ENV === 'development' && { debug: error.message }),
     });
   }
 }
