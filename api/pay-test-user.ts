@@ -1,27 +1,25 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
-const PiNetwork = require('@pinetwork-js/api-backend');
+import axios from 'axios';
+import * as StellarSdk from 'stellar-sdk';
 
 // ============================================================
 // CONFIG
 // ============================================================
 const IS_MAINNET = process.env.PI_NETWORK === 'mainnet';
 
+const PI_API_BASE = 'https://api.minepi.com/v2';
+
+const STELLAR_HORIZON = IS_MAINNET
+  ? 'https://api.mainnet.minepi.com'
+  : 'https://api.testnet.minepi.com';
+
+// CRITICAL: must match the network exactly
+const NETWORK_PASSPHRASE = IS_MAINNET ? 'Pi Network' : 'Pi Testnet';
+
 const PAYMENT_CONFIG = {
-  amount: 0.1,
+  amount: '0.1',
   memo: IS_MAINNET ? 'A2U Mainnet Reward' : 'A2U Testnet Completion',
   metadata: { type: 'checklist_10_10' },
-  network: IS_MAINNET ? 'mainnet' : 'pi_testnet',
-};
-
-// ============================================================
-// KNOWN PI ERROR MESSAGES
-// ============================================================
-const PI_ERROR_MESSAGES: Record<string, string> = {
-  user_not_found: 'User not found on the Pi Network.',
-  insufficient_funds: 'Wallet has insufficient funds.',
-  payment_already_exists: 'This payment has already been processed.',
-  invalid_uid: 'Invalid user identifier.',
-  network_error: 'Network error, please try again.',
 };
 
 // ============================================================
@@ -29,7 +27,7 @@ const PI_ERROR_MESSAGES: Record<string, string> = {
 // ============================================================
 const rateLimitMap = new Map<string, { count: number; startTime: number }>();
 const RATE_LIMIT_WINDOW_MS = 60 * 1000; // 1 minute
-const RATE_LIMIT_MAX_REQUESTS = 3;       // 3 requests per UID
+const RATE_LIMIT_MAX_REQUESTS = 3;      // 3 requests per UID per minute
 
 function isRateLimited(uid: string): boolean {
   const now = Date.now();
@@ -47,106 +45,85 @@ function isRateLimited(uid: string): boolean {
 }
 
 // ============================================================
-// INIT PI SDK - Once on module load
+// VALIDATE ENV VARS ON STARTUP
 // ============================================================
-let pi: any;
-try {
-  // Select correct API key
-  const apiKey = IS_MAINNET
-    ? process.env.PI_API_KEY_MAINNET
-    : process.env.PI_API_KEY_TESTNET;
+const API_KEY = IS_MAINNET
+  ? process.env.PI_API_KEY_MAINNET
+  : process.env.PI_API_KEY_TESTNET;
 
-  // Select correct wallet seed
-  const walletSeed = IS_MAINNET
-    ? process.env.PI_APP_WALLET_SEED_MAINNET
-    : process.env.PI_APP_WALLET_SEED_TESTNET;
+const WALLET_SEED = IS_MAINNET
+  ? process.env.PI_APP_WALLET_SEED_MAINNET
+  : process.env.PI_APP_WALLET_SEED_TESTNET;
 
-  if (!apiKey) {
-    throw new Error(
-      IS_MAINNET
-        ? 'PI_API_KEY_MAINNET is missing from .env'
-        : 'PI_API_KEY_TESTNET is missing from .env'
-    );
-  }
-
-  if (!walletSeed) {
-    throw new Error(
-      IS_MAINNET
-        ? 'PI_APP_WALLET_SEED_MAINNET is missing from .env'
-        : 'PI_APP_WALLET_SEED_TESTNET is missing from .env'
-    );
-  }
-
-  pi = new PiNetwork(
-    apiKey,
-    walletSeed,
-    IS_MAINNET ? 'mainnet' : 'pi_testnet'
-  );
-
-  console.log(`[Pi SDK] Initialized on ${PAYMENT_CONFIG.network}`);
-} catch (initError: any) {
-  console.error('[Pi SDK] Initialization failed:', initError.message);
+if (!API_KEY) {
+  console.error(`[pay-test-user] Missing ${IS_MAINNET ? 'PI_API_KEY_MAINNET' : 'PI_API_KEY_TESTNET'}`);
+}
+if (!WALLET_SEED) {
+  console.error(`[pay-test-user] Missing ${IS_MAINNET ? 'PI_APP_WALLET_SEED_MAINNET' : 'PI_APP_WALLET_SEED_TESTNET'}`);
 }
 
 // ============================================================
-// HELPER - Resolve a friendly error message
+// HELPER - Axios client for Pi API
 // ============================================================
-function resolveErrorMessage(error: any): string {
-  const errorKey = Object.keys(PI_ERROR_MESSAGES).find(
-    (key) =>
-      error?.code === key ||
-      error?.message?.toLowerCase().includes(key.toLowerCase())
-  );
-  return errorKey
-    ? PI_ERROR_MESSAGES[errorKey]
-    : error?.message || 'An unexpected error occurred.';
-}
+const piAxios = axios.create({
+  baseURL: PI_API_BASE,
+  timeout: 20000,
+  headers: {
+    Authorization: `Key ${API_KEY}`,
+    'Content-Type': 'application/json',
+  },
+});
 
 // ============================================================
 // HELPER - Log transaction (replace with DB call in Production)
 // ============================================================
-async function logTransaction(data: {
+function logTransaction(data: {
   uid: string;
   paymentId: string | null;
   txid: string | null;
   status: string;
   error?: string;
-}): Promise<void> {
-  // Example: await db.transactions.create({ ...data, createdAt: new Date() });
+}): void {
   console.log('[Transaction Log]', {
     ...data,
-    network: PAYMENT_CONFIG.network,
+    network: NETWORK_PASSPHRASE,
     timestamp: new Date().toISOString(),
   });
+}
+
+// ============================================================
+// HELPER - Resolve friendly error message
+// ============================================================
+function resolveErrorMessage(error: any): string {
+  const piMsg = error?.response?.data?.message || error?.response?.data?.error_code;
+  return piMsg || error?.message || 'An unexpected error occurred.';
 }
 
 // ============================================================
 // MAIN HANDLER
 // ============================================================
 export default async function handler(req: VercelRequest, res: VercelResponse) {
+
   // 1. Method check
   if (req.method !== 'POST') {
     return res.status(405).json({ error: 'Method Not Allowed' });
   }
 
-  // 2. SDK guard
-  if (!pi) {
-    return res.status(500).json({ error: 'Pi SDK is not initialized.' });
+  // 2. ENV guard
+  if (!API_KEY || !WALLET_SEED) {
+    return res.status(500).json({ error: 'Server misconfiguration: missing API key or wallet seed.' });
   }
 
   // 3. Validate UID
   const { uid } = req.body ?? {};
-
   if (!uid || typeof uid !== 'string' || uid.trim() === '') {
-    console.error('[Backend] Error: UID is missing or invalid.');
     return res.status(400).json({ error: 'invalid_uid', message: 'User UID is required.' });
   }
-
   const sanitizedUid = uid.trim();
 
   // 4. Rate limiting
   if (isRateLimited(sanitizedUid)) {
-    console.warn(`[Backend] Rate limit exceeded for UID: ${sanitizedUid}`);
+    console.warn(`[pay-test-user] Rate limit exceeded for UID: ${sanitizedUid}`);
     return res.status(429).json({
       error: 'rate_limit_exceeded',
       message: 'Too many requests. Please wait a minute and try again.',
@@ -154,32 +131,87 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   }
 
   let paymentId: string | null = null;
+  let txid: string | null = null;
 
   try {
-    console.log(`[Backend] Initiating A2U payment for UID: ${sanitizedUid} on ${PAYMENT_CONFIG.network}`);
+    console.log(`[pay-test-user] Starting A2U for UID: ${sanitizedUid} | Network: ${NETWORK_PASSPHRASE}`);
 
-    // 5. Create the payment
-    paymentId = await pi.createPayment({
-      amount: PAYMENT_CONFIG.amount,
+    // --------------------------------------------------------
+    // STEP 1 - Create payment on Pi server
+    // Returns: paymentId (identifier) + recipientAddress (recipient)
+    // --------------------------------------------------------
+    const createRes = await piAxios.post('/payments', {
+      amount: parseFloat(PAYMENT_CONFIG.amount),
       memo: PAYMENT_CONFIG.memo,
       metadata: PAYMENT_CONFIG.metadata,
       uid: sanitizedUid,
     });
 
-    if (!paymentId) throw new Error('Payment creation failed. No paymentId received.');
-    console.log(`[Backend] Payment created. PaymentID: ${paymentId}`);
+    paymentId = createRes.data.identifier;
+    const recipientAddress: string = createRes.data.recipient;
 
-    // 6. Submit to blockchain
-    const txid: string = await pi.submitPayment(paymentId);
-    if (!txid) throw new Error('Payment submission failed. No TXID received.');
-    console.log(`[Backend] Payment submitted to blockchain. TXID: ${txid}`);
+    if (!paymentId || !recipientAddress) {
+      throw new Error('Pi server did not return paymentId or recipientAddress.');
+    }
+    console.log(`[pay-test-user] Payment created. ID: ${paymentId} | Recipient: ${recipientAddress}`);
 
-    // 7. Complete payment on Pi servers
-    await pi.completePayment(paymentId, txid);
-    console.log(`[Backend] Payment completed successfully. TXID: ${txid}`);
+    // --------------------------------------------------------
+    // STEP 2 - Load app wallet account from Pi blockchain
+    // Always load fresh - account could have changed
+    // --------------------------------------------------------
+    const server = new StellarSdk.Server(STELLAR_HORIZON, { allowHttp: false });
+    const keypair = StellarSdk.Keypair.fromSecret(WALLET_SEED);
+    const myPublicKey = keypair.publicKey();
 
-    // 8. Log successful transaction
-    await logTransaction({ uid: sanitizedUid, paymentId, txid, status: 'completed' });
+    const [account, baseFee, timebounds] = await Promise.all([
+      server.loadAccount(myPublicKey),
+      server.fetchBaseFee(),
+      server.fetchTimebounds(180),
+    ]);
+    console.log(`[pay-test-user] Account loaded. PublicKey: ${myPublicKey}`);
+
+    // --------------------------------------------------------
+    // STEP 3 - Build transaction
+    // CRITICAL: paymentId must be the memo
+    // CRITICAL: networkPassphrase must match the network
+    // --------------------------------------------------------
+    const paymentOperation = StellarSdk.Operation.payment({
+      destination: recipientAddress,
+      asset: StellarSdk.Asset.native(),
+      amount: PAYMENT_CONFIG.amount,
+    });
+
+    const transaction = new StellarSdk.TransactionBuilder(account, {
+      fee: String(baseFee),
+      networkPassphrase: NETWORK_PASSPHRASE,
+      timebounds,
+    })
+      .addOperation(paymentOperation)
+      .addMemo(StellarSdk.Memo.text(paymentId)) // REQUIRED by Pi Network
+      .build();
+
+    // --------------------------------------------------------
+    // STEP 4 - Sign transaction with app wallet seed
+    // --------------------------------------------------------
+    transaction.sign(keypair);
+    console.log(`[pay-test-user] Transaction signed.`);
+
+    // --------------------------------------------------------
+    // STEP 5 - Submit transaction to Pi blockchain
+    // --------------------------------------------------------
+    const submitResult = await server.submitTransaction(transaction);
+    txid = submitResult.id;
+
+    if (!txid) throw new Error('Blockchain submission failed. No TXID received.');
+    console.log(`[pay-test-user] Transaction submitted. TXID: ${txid}`);
+
+    // --------------------------------------------------------
+    // STEP 6 - Complete payment on Pi server
+    // --------------------------------------------------------
+    await piAxios.post(`/payments/${paymentId}/complete`, { txid });
+    console.log(`[pay-test-user] Payment completed. TXID: ${txid}`);
+
+    logTransaction({ uid: sanitizedUid, paymentId, txid, status: 'completed' });
 
     return res.status(200).json({
       success: true,
@@ -189,20 +221,21 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     });
 
   } catch (error: any) {
-    console.error(`[Backend] Error for UID ${sanitizedUid}:`, error.message);
+    const errMsg = resolveErrorMessage(error);
+    console.error(`[pay-test-user] Error for UID ${sanitizedUid}:`, error?.response?.data || error.message);
 
-    await logTransaction({
+    logTransaction({
       uid: sanitizedUid,
       paymentId,
-      txid: null,
+      txid,
       status: 'failed',
-      error: error.message,
+      error: errMsg,
     });
 
     return res.status(500).json({
       error: 'payment_failed',
-      message: resolveErrorMessage(error),
-      ...(process.env.NODE_ENV === 'development' && { debug: error.message }),
+      message: errMsg,
+      ...(process.env.NODE_ENV === 'development' && { debug: error?.response?.data || error.message }),
     });
   }
 }
