@@ -29,22 +29,17 @@ function App() {
 
       const response = await fetch('/api/pay-test-user', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          uid: user.uid,
-          network: 'pi_testnet',
-        }),
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ uid: user.uid }), // network comes from PI_NETWORK env var
       });
 
       const data = await response.json();
 
       if (!response.ok) {
-        throw new Error(data.error || 'Payment failed');
+        throw new Error(data.message || data.error || 'Payment failed');
       }
 
-      setMessage(`${data.message} Payment ID: ${data.paymentId ?? 'N/A'}`);
+      setMessage(`${data.message} TXID: ${data.txid ?? 'N/A'}`);
     } catch (error: unknown) {
       console.error(error);
       setMessage(`Error: ${error instanceof Error ? error.message : 'Unknown error'}`);
@@ -57,8 +52,7 @@ function App() {
     try {
       setLoading(true);
       setMessage('Initiating payment...');
-      // Request 1 Pi for a test product
-      await createPayment(1, "Test Payment for LIFE-APP");
+      await createPayment(1, 'Test Payment for LIFE-APP');
       setMessage('Payment flow completed. Check backend logs for final status.');
     } catch (error) {
       setMessage('Payment failed.');
@@ -71,13 +65,13 @@ function App() {
     <div className="min-h-screen flex flex-col items-center justify-center p-4 bg-gray-100">
       <div className="bg-white p-8 rounded-2xl shadow-lg max-w-md w-full text-center">
         <h1 className="text-3xl font-bold text-purple-600 mb-4">LIFE-APP</h1>
-        
+
         {!user ? (
           <>
             <p className="text-gray-600 mb-8">
               Welcome to Pi Network Integration
             </p>
-            <button 
+            <button
               onClick={handleAuth}
               disabled={loading}
               className="bg-purple-600 hover:bg-purple-700 disabled:bg-purple-300 text-white font-bold py-2 px-4 rounded-lg w-full transition-colors"
@@ -94,7 +88,7 @@ function App() {
               <p><strong>UID:</strong> {user.uid}</p>
               <p><strong>Roles:</strong> {user.roles?.join(', ')}</p>
             </div>
-            <button 
+            <button
               onClick={handlePayment}
               disabled={loading || a2uLoading}
               className="bg-green-500 hover:bg-green-600 disabled:bg-green-300 text-white font-bold py-2 px-4 rounded-lg w-full transition-colors"
