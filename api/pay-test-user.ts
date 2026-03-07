@@ -1,20 +1,22 @@
-import { NextResponse } from 'next/server';
+import type { VercelRequest, VercelResponse } from '@vercel/node';
 const PiNetwork = require('@pinetwork-js/api-backend');
 
 // ============================================================
-// CONFIG - Can be moved to a separate config file
+// CONFIG
 // ============================================================
 const IS_MAINNET = process.env.PI_NETWORK === 'mainnet';
 
 const PAYMENT_CONFIG = {
   amount: 0.1,
-  memo: "A2U Testnet Completion",
-  metadata: { type: "checklist_10_10" },
+  memo: IS_MAINNET ? 'A2U Mainnet Reward' : 'A2U Testnet Completion',
+  metadata: { type: 'checklist_10_10' },
   network: IS_MAINNET ? 'mainnet' : 'pi_testnet',
 };
 
-// Known Pi Network API errors
-const PI_ERROR_MESSAGES = {
+// ============================================================
+// KNOWN PI ERROR MESSAGES
+// ============================================================
+const PI_ERROR_MESSAGES: Record<string, string> = {
   user_not_found: 'User not found on the Pi Network.',
   insufficient_funds: 'Wallet has insufficient funds.',
   payment_already_exists: 'This payment has already been processed.',
@@ -25,11 +27,11 @@ const PI_ERROR_MESSAGES = {
 // ============================================================
 // RATE LIMITER - In-memory (replace with Upstash in Production)
 // ============================================================
-const rateLimitMap = new Map();
+const rateLimitMap = new Map<string, { count: number; startTime: number }>();
 const RATE_LIMIT_WINDOW_MS = 60 * 1000; // 1 minute
 const RATE_LIMIT_MAX_REQUESTS = 3;       // 3 requests per UID
 
-function isRateLimited(uid) {
+function isRateLimited(uid: string): boolean {
   const now = Date.now();
   const record = rateLimitMap.get(uid);
 
@@ -38,9 +40,7 @@ function isRateLimited(uid) {
     return false;
   }
 
-  if (record.count >= RATE_LIMIT_MAX_REQUESTS) {
-    return true;
-  }
+  if (record.count >= RATE_LIMIT_MAX_REQUESTS) return true;
 
   record.count += 1;
   return false;
@@ -49,33 +49,49 @@ function isRateLimited(uid) {
 // ============================================================
 // INIT PI SDK - Once on module load
 // ============================================================
-let pi;
+let pi: any;
 try {
-  if (!process.env.PI_APP_WALLET_SEED) {
-    throw new Error('PI_APP_WALLET_SEED is missing from .env');
+  // Select correct API key
+  const apiKey = IS_MAINNET
+    ? process.env.PI_API_KEY_MAINNET
+    : process.env.PI_API_KEY_TESTNET;
+
+  // Select correct wallet seed
+  const walletSeed = IS_MAINNET
+    ? process.env.PI_APP_WALLET_SEED_MAINNET
+    : process.env.PI_APP_WALLET_SEED_TESTNET;
+
+  if (!apiKey) {
+    throw new Error(
+      IS_MAINNET
+        ? 'PI_API_KEY_MAINNET is missing from .env'
+        : 'PI_API_KEY_TESTNET is missing from .env'
+    );
   }
-  if (IS_MAINNET && !process.env.PI_API_KEY_MAINNET) {
-    throw new Error('PI_API_KEY_MAINNET is missing from .env');
-  }
-  if (!IS_MAINNET && !process.env.PI_API_KEY_TESTNET) {
-    throw new Error('PI_API_KEY_TESTNET is missing from .env');
+
+  if (!walletSeed) {
+    throw new Error(
+      IS_MAINNET
+        ? 'PI_APP_WALLET_SEED_MAINNET is missing from .env'
+        : 'PI_APP_WALLET_SEED_TESTNET is missing from .env'
+    );
   }
 
   pi = new PiNetwork(
-    IS_MAINNET ? process.env.PI_API_KEY_MAINNET : process.env.PI_API_KEY_TESTNET,
-    process.env.PI_APP_WALLET_SEED,
+    apiKey,
+    walletSeed,
     IS_MAINNET ? 'mainnet' : 'pi_testnet'
   );
 
   console.log(`[Pi SDK] Initialized on ${PAYMENT_CONFIG.network}`);
-} catch (initError) {
+} catch (initError: any) {
   console.error('[Pi SDK] Initialization failed:', initError.message);
 }
 
 // ============================================================
 // HELPER - Resolve a friendly error message
 // ============================================================
-function resolveErrorMessage(error) {
+function resolveErrorMessage(error: any): string {
   const errorKey = Object.keys(PI_ERROR_MESSAGES).find(
     (key) =>
       error?.code === key ||
@@ -89,14 +105,17 @@ function resolveErrorMessage(error) {
 // ============================================================
 // HELPER - Log transaction (replace with DB call in Production)
 // ============================================================
-async function logTransaction({ uid, paymentId, txid, status, error }) {
-  // Example: await db.transactions.create({ uid, paymentId, txid, status, error, createdAt: new Date() });
+async function logTransaction(data: {
+  uid: string;
+  paymentId: string | null;
+  txid: string | null;
+  status: string;
+  error?: string;
+}): Promise<void> {
+  // Example: await db.transactions.create({ ...data, createdAt: new Date() });
   console.log('[Transaction Log]', {
-    uid,
-    paymentId: paymentId || null,
-    txid: txid || null,
-    status,
-    error: error || null,
+    ...data,
+    network: PAYMENT_CONFIG.network,
     timestamp: new Date().toISOString(),
   });
 }
@@ -104,35 +123,23 @@ async function logTransaction({ uid, paymentId, txid, status, error }) {
 // ============================================================
 // MAIN HANDLER
 // ============================================================
-export async function POST(req) {
-  // 1. Check SDK initialization
+export default async function handler(req: VercelRequest, res: VercelResponse) {
+  // 1. Method check
+  if (req.method !== 'POST') {
+    return res.status(405).json({ error: 'Method Not Allowed' });
+  }
+
+  // 2. SDK guard
   if (!pi) {
-    return NextResponse.json(
-      { error: 'server_error', message: 'Pi SDK is not initialized.' },
-      { status: 500 }
-    );
+    return res.status(500).json({ error: 'Pi SDK is not initialized.' });
   }
-
-  // 2. Parse request body
-  let body;
-  try {
-    body = await req.json();
-  } catch {
-    return NextResponse.json(
-      { error: 'invalid_body', message: 'Invalid request. Please send valid JSON.' },
-      { status: 400 }
-    );
-  }
-
-  const { uid } = body;
 
   // 3. Validate UID
+  const { uid } = req.body ?? {};
+
   if (!uid || typeof uid !== 'string' || uid.trim() === '') {
     console.error('[Backend] Error: UID is missing or invalid.');
-    return NextResponse.json(
-      { error: 'invalid_uid', message: 'User UID is required.' },
-      { status: 400 }
-    );
+    return res.status(400).json({ error: 'invalid_uid', message: 'User UID is required.' });
   }
 
   const sanitizedUid = uid.trim();
@@ -140,19 +147,16 @@ export async function POST(req) {
   // 4. Rate limiting
   if (isRateLimited(sanitizedUid)) {
     console.warn(`[Backend] Rate limit exceeded for UID: ${sanitizedUid}`);
-    return NextResponse.json(
-      {
-        error: 'rate_limit_exceeded',
-        message: 'Too many requests. Please wait a minute and try again.',
-      },
-      { status: 429 }
-    );
+    return res.status(429).json({
+      error: 'rate_limit_exceeded',
+      message: 'Too many requests. Please wait a minute and try again.',
+    });
   }
 
-  let paymentId = null;
+  let paymentId: string | null = null;
 
   try {
-    console.log(`[Backend] Initiating A2U payment for UID: ${sanitizedUid}`);
+    console.log(`[Backend] Initiating A2U payment for UID: ${sanitizedUid} on ${PAYMENT_CONFIG.network}`);
 
     // 5. Create the payment
     paymentId = await pi.createPayment({
@@ -166,7 +170,7 @@ export async function POST(req) {
     console.log(`[Backend] Payment created. PaymentID: ${paymentId}`);
 
     // 6. Submit to blockchain
-    const txid = await pi.submitPayment(paymentId);
+    const txid: string = await pi.submitPayment(paymentId);
     if (!txid) throw new Error('Payment submission failed. No TXID received.');
     console.log(`[Backend] Payment submitted to blockchain. TXID: ${txid}`);
 
@@ -177,20 +181,16 @@ export async function POST(req) {
     // 8. Log successful transaction
     await logTransaction({ uid: sanitizedUid, paymentId, txid, status: 'completed' });
 
-    return NextResponse.json(
-      {
-        success: true,
-        txid,
-        paymentId,
-        message: 'Payment completed successfully.',
-      },
-      { status: 200 }
-    );
+    return res.status(200).json({
+      success: true,
+      txid,
+      paymentId,
+      message: 'Payment completed successfully.',
+    });
 
-  } catch (error) {
-    console.error(`[Backend] Error processing payment for UID ${sanitizedUid}:`, error.message);
+  } catch (error: any) {
+    console.error(`[Backend] Error for UID ${sanitizedUid}:`, error.message);
 
-    // Log failed transaction
     await logTransaction({
       uid: sanitizedUid,
       paymentId,
@@ -199,15 +199,10 @@ export async function POST(req) {
       error: error.message,
     });
 
-    const friendlyMessage = resolveErrorMessage(error);
-
-    return NextResponse.json(
-      {
-        error: 'payment_failed',
-        message: friendlyMessage,
-        ...(process.env.NODE_ENV === 'development' && { debug: error.message }),
-      },
-      { status: 500 }
-    );
+    return res.status(500).json({
+      error: 'payment_failed',
+      message: resolveErrorMessage(error),
+      ...(process.env.NODE_ENV === 'development' && { debug: error.message }),
+    });
   }
 }
