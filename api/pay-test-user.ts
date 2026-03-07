@@ -1,181 +1,213 @@
-/**
- * POST /api/pay-test-user
- *
- * App-to-User payment endpoint.
- * Sends 0.1 Test-Pi (or Mainnet Pi) from the app wallet to a specific user.
- * This endpoint fulfils the "10 unique wallet transactions" requirement on
- * the Pi Testnet by initiating, approving, and completing a server-side
- * payment to a given Pi user UID.
- *
- * Request body:
- *   {
- *     uid     : string  — Pi user UID to receive the payment
- *     network : string  — 'pi_testnet' (default) | 'pi_mainnet'
- *   }
- *
- * Security: all sensitive keys are read from environment variables only.
- */
+import { NextResponse } from 'next/server';
+const PiNetwork = require('@pinetwork-js/api-backend');
 
-import type { VercelRequest, VercelResponse } from '@vercel/node';
-import axios from 'axios';
+// ============================================================
+// CONFIG - Can be moved to a separate config file
+// ============================================================
+const IS_MAINNET = process.env.PI_NETWORK === 'mainnet';
 
-const PI_BASE_URL = 'https://api.minepi.com/v2';
+const PAYMENT_CONFIG = {
+  amount: 0.1,
+  memo: "A2U Testnet Completion",
+  metadata: { type: "checklist_10_10" },
+  network: IS_MAINNET ? 'mainnet' : 'pi_testnet',
+};
 
-/** Milliseconds to wait between blockchain confirmation poll attempts. */
-const POLL_INTERVAL_MS = 3_000;
-/** Maximum number of poll attempts before returning a 202 Accepted. */
-const MAX_POLL_ATTEMPTS = 10;
+// Known Pi Network API errors
+const PI_ERROR_MESSAGES = {
+  user_not_found: 'User not found on the Pi Network.',
+  insufficient_funds: 'Wallet has insufficient funds.',
+  payment_already_exists: 'This payment has already been processed.',
+  invalid_uid: 'Invalid user identifier.',
+  network_error: 'Network error, please try again.',
+};
 
-/** In-memory store — resets on cold start. Best-effort guard within a
- *  single function instance; the Pi Network API enforces payment state
- *  machine on its side. */
-const paymentStore = new Map<string, { status: string; network: string; uid?: string; txid?: string }>();
+// ============================================================
+// RATE LIMITER - In-memory (replace with Upstash in Production)
+// ============================================================
+const rateLimitMap = new Map();
+const RATE_LIMIT_WINDOW_MS = 60 * 1000; // 1 minute
+const RATE_LIMIT_MAX_REQUESTS = 3;       // 3 requests per UID
 
-export default async function handler(
-  req: VercelRequest,
-  res: VercelResponse
-) {
-  if (req.method !== 'POST') {
-    return res.status(405).json({ error: 'Method Not Allowed' });
+function isRateLimited(uid) {
+  const now = Date.now();
+  const record = rateLimitMap.get(uid);
+
+  if (!record || now - record.startTime > RATE_LIMIT_WINDOW_MS) {
+    rateLimitMap.set(uid, { count: 1, startTime: now });
+    return false;
   }
 
-  const { uid, network = 'pi_testnet' } = req.body ?? {};
-
-  // Validate uid
-  if (!uid || typeof uid !== 'string') {
-    return res
-      .status(400)
-      .json({ error: 'Missing or invalid uid (Pi user identifier)' });
+  if (record.count >= RATE_LIMIT_MAX_REQUESTS) {
+    return true;
   }
 
-  // Validate network
-  if (network !== 'pi_testnet' && network !== 'pi_mainnet') {
-    return res
-      .status(400)
-      .json({ error: `Invalid network "${network}". Must be "pi_testnet" or "pi_mainnet".` });
+  record.count += 1;
+  return false;
+}
+
+// ============================================================
+// INIT PI SDK - Once on module load
+// ============================================================
+let pi;
+try {
+  if (!process.env.PI_APP_WALLET_SEED) {
+    throw new Error('PI_APP_WALLET_SEED is missing from .env');
+  }
+  if (IS_MAINNET && !process.env.PI_API_KEY_MAINNET) {
+    throw new Error('PI_API_KEY_MAINNET is missing from .env');
+  }
+  if (!IS_MAINNET && !process.env.PI_API_KEY_TESTNET) {
+    throw new Error('PI_API_KEY_TESTNET is missing from .env');
   }
 
-  const apiKey =
-    network === 'pi_mainnet'
-      ? process.env.PI_API_KEY_MAINNET
-      : process.env.PI_API_KEY_TESTNET;
+  pi = new PiNetwork(
+    IS_MAINNET ? process.env.PI_API_KEY_MAINNET : process.env.PI_API_KEY_TESTNET,
+    process.env.PI_APP_WALLET_SEED,
+    IS_MAINNET ? 'mainnet' : 'pi_testnet'
+  );
 
-  if (!apiKey) {
-    console.error(`[pay-test-user] Missing API key for ${network}`);
-    return res.status(500).json({ error: `API key not configured for ${network}` });
+  console.log(`[Pi SDK] Initialized on ${PAYMENT_CONFIG.network}`);
+} catch (initError) {
+  console.error('[Pi SDK] Initialization failed:', initError.message);
+}
+
+// ============================================================
+// HELPER - Resolve a friendly error message
+// ============================================================
+function resolveErrorMessage(error) {
+  const errorKey = Object.keys(PI_ERROR_MESSAGES).find(
+    (key) =>
+      error?.code === key ||
+      error?.message?.toLowerCase().includes(key.toLowerCase())
+  );
+  return errorKey
+    ? PI_ERROR_MESSAGES[errorKey]
+    : error?.message || 'An unexpected error occurred.';
+}
+
+// ============================================================
+// HELPER - Log transaction (replace with DB call in Production)
+// ============================================================
+async function logTransaction({ uid, paymentId, txid, status, error }) {
+  // Example: await db.transactions.create({ uid, paymentId, txid, status, error, createdAt: new Date() });
+  console.log('[Transaction Log]', {
+    uid,
+    paymentId: paymentId || null,
+    txid: txid || null,
+    status,
+    error: error || null,
+    timestamp: new Date().toISOString(),
+  });
+}
+
+// ============================================================
+// MAIN HANDLER
+// ============================================================
+export async function POST(req) {
+  // 1. Check SDK initialization
+  if (!pi) {
+    return NextResponse.json(
+      { error: 'server_error', message: 'Pi SDK is not initialized.' },
+      { status: 500 }
+    );
   }
 
-  const walletSeed = process.env.PI_APP_WALLET_SEED;
-  if (!walletSeed) {
-    console.error('[pay-test-user] Missing PI_APP_WALLET_SEED environment variable');
-    return res.status(500).json({ error: 'App wallet seed not configured' });
+  // 2. Parse request body
+  let body;
+  try {
+    body = await req.json();
+  } catch {
+    return NextResponse.json(
+      { error: 'invalid_body', message: 'Invalid request. Please send valid JSON.' },
+      { status: 400 }
+    );
   }
-  // walletSeed is required for Stellar transaction signing when submitting
-  // payments directly to the Pi blockchain. Validated here to fail fast
-  // before initiating a payment that would otherwise be stuck in approved state.
 
-  const headers = { Authorization: `Key ${apiKey}` };
+  const { uid } = body;
+
+  // 3. Validate UID
+  if (!uid || typeof uid !== 'string' || uid.trim() === '') {
+    console.error('[Backend] Error: UID is missing or invalid.');
+    return NextResponse.json(
+      { error: 'invalid_uid', message: 'User UID is required.' },
+      { status: 400 }
+    );
+  }
+
+  const sanitizedUid = uid.trim();
+
+  // 4. Rate limiting
+  if (isRateLimited(sanitizedUid)) {
+    console.warn(`[Backend] Rate limit exceeded for UID: ${sanitizedUid}`);
+    return NextResponse.json(
+      {
+        error: 'rate_limit_exceeded',
+        message: 'Too many requests. Please wait a minute and try again.',
+      },
+      { status: 429 }
+    );
+  }
+
+  let paymentId = null;
 
   try {
-    // ── Step 1: Create the App-to-User payment ────────────────────────────
-    const createRes = await axios.post(
-      `${PI_BASE_URL}/payments`,
+    console.log(`[Backend] Initiating A2U payment for UID: ${sanitizedUid}`);
+
+    // 5. Create the payment
+    paymentId = await pi.createPayment({
+      amount: PAYMENT_CONFIG.amount,
+      memo: PAYMENT_CONFIG.memo,
+      metadata: PAYMENT_CONFIG.metadata,
+      uid: sanitizedUid,
+    });
+
+    if (!paymentId) throw new Error('Payment creation failed. No paymentId received.');
+    console.log(`[Backend] Payment created. PaymentID: ${paymentId}`);
+
+    // 6. Submit to blockchain
+    const txid = await pi.submitPayment(paymentId);
+    if (!txid) throw new Error('Payment submission failed. No TXID received.');
+    console.log(`[Backend] Payment submitted to blockchain. TXID: ${txid}`);
+
+    // 7. Complete payment on Pi servers
+    await pi.completePayment(paymentId, txid);
+    console.log(`[Backend] Payment completed successfully. TXID: ${txid}`);
+
+    // 8. Log successful transaction
+    await logTransaction({ uid: sanitizedUid, paymentId, txid, status: 'completed' });
+
+    return NextResponse.json(
       {
-        amount: 0.1,
-        memo: 'LIFE-APP reward payment',
-        metadata: { source: 'pay-test-user', purpose: '10-wallet-goal' },
-        uid,
+        success: true,
+        txid,
+        paymentId,
+        message: 'Payment completed successfully.',
       },
-      { headers }
+      { status: 200 }
     );
 
-    const paymentId: string = createRes.data?.identifier;
-    if (!paymentId) {
-      throw new Error('Pi API did not return a paymentId');
-    }
+  } catch (error) {
+    console.error(`[Backend] Error processing payment for UID ${sanitizedUid}:`, error.message);
 
-    // ── Double-spend guard ────────────────────────────────────────────────
-    if (paymentStore.has(paymentId)) {
-      return res.status(409).json({
-        error: 'Payment already processed (double-spend prevention)',
-        paymentId,
-      });
-    }
-    paymentStore.set(paymentId, { status: 'pending', network, uid });
-
-    // ── Step 2: Approve the payment ───────────────────────────────────────
-    await axios.post(
-      `${PI_BASE_URL}/payments/${paymentId}/approve`,
-      {},
-      { headers }
-    );
-    paymentStore.set(paymentId, { status: 'approved', network, uid });
-
-    // ── Step 3: Poll for blockchain confirmation (txid) ───────────────────
-    // Pi Network submits the transaction to the blockchain asynchronously.
-    // We poll the payment status until a txid appears.
-    let txid: string | null = null;
-    for (let _attempt = 0; _attempt < MAX_POLL_ATTEMPTS; _attempt++) {
-      const statusRes = await axios.get(
-        `${PI_BASE_URL}/payments/${paymentId}`,
-        { headers }
-      );
-      if (statusRes.data?.transaction?.txid) {
-        txid = statusRes.data.transaction.txid as string;
-        break;
-      }
-      // Wait before the next poll (skip delay after the last attempt)
-      if (_attempt < MAX_POLL_ATTEMPTS - 1) {
-        await new Promise<void>((resolve) =>
-          setTimeout(resolve, POLL_INTERVAL_MS)
-        );
-      }
-    }
-
-    // If the transaction hasn't landed yet, respond with 202 Accepted.
-    // The frontend (or a webhook) can call /api/complete-payment later.
-    if (!txid) {
-      return res.status(202).json({
-        message:
-          'Payment approved and submitted. Awaiting blockchain confirmation.',
-        paymentId,
-      });
-    }
-
-    // ── Step 4: Complete the payment ──────────────────────────────────────
-    await axios.post(
-      `${PI_BASE_URL}/payments/${paymentId}/complete`,
-      { txid },
-      { headers }
-    );
-    paymentStore.set(paymentId, { status: 'completed', network, uid, txid });
-
-    console.log(
-      `[pay-test-user] Payment ${paymentId} completed. txid=${txid}`
-    );
-
-    return res.status(200).json({
-      message: 'App-to-User payment completed successfully',
+    // Log failed transaction
+    await logTransaction({
+      uid: sanitizedUid,
       paymentId,
-      txid,
+      txid: null,
+      status: 'failed',
+      error: error.message,
     });
-  } catch (error: any) {
-    const piError = error.response?.data;
-    const httpStatus = error.response?.status ?? 500;
 
-    console.error(
-      '[pay-test-user] Error:',
-      piError ?? error.message
+    const friendlyMessage = resolveErrorMessage(error);
+
+    return NextResponse.json(
+      {
+        error: 'payment_failed',
+        message: friendlyMessage,
+        ...(process.env.NODE_ENV === 'development' && { debug: error.message }),
+      },
+      { status: 500 }
     );
-
-    // Surface Pi API error codes (e.g. 401 Unauthorized, 400 Bad Request)
-    // without leaking sensitive server-side details.
-    return res.status(httpStatus).json({
-      error: 'Payment failed',
-      detail:
-        piError?.error_message ??
-        piError?.message ??
-        error.message,
-    });
   }
 }
