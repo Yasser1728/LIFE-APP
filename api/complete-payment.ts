@@ -1,5 +1,5 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
-const PiNetwork = require('@pinetwork-js/api-backend');
+import PiNetwork from '@pinetwork-js/api-backend';
 
 // ============================================================
 // CONFIG
