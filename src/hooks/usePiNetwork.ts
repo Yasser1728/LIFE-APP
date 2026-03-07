@@ -2,13 +2,6 @@ import { useState } from 'react';
 import axios from 'axios';
 
 // ============================================================
-// CONFIG
-// Set VITE_PI_SANDBOX=true in .env for testnet
-// Set VITE_PI_SANDBOX=false in .env for mainnet
-// ============================================================
-const IS_SANDBOX = import.meta.env.VITE_PI_SANDBOX !== 'false';
-
-// ============================================================
 // TYPES
 // ============================================================
 interface PiUser {
@@ -83,9 +76,8 @@ export const usePiNetwork = () => {
     try {
       const scopes = ['payments', 'username'];
 
-      // Initialize Pi SDK with correct sandbox mode
-      window.Pi.init({ version: '2.0', sandbox: IS_SANDBOX });
-      console.log(`[Pi] Initialized. sandbox=${IS_SANDBOX}`);
+      // IS_SANDBOX is set in PiPayment.jsx via VITE_PI_SANDBOX env var
+      window.Pi.init({ version: '2.0' });
 
       const authResult = await window.Pi.authenticate(scopes, onIncompletePaymentFound);
 
