@@ -200,7 +200,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     // STEP 5 - Submit transaction to Pi blockchain
     // --------------------------------------------------------
     const submitResult = await server.submitTransaction(transaction);
-    txid = submitResult.id;
+    txid = submitResult.hash;
 
     if (!txid) throw new Error('Blockchain submission failed. No TXID received.');
     console.log(`[pay-test-user] Transaction submitted. TXID: ${txid}`);
