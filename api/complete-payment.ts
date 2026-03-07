@@ -1,26 +1,20 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
-import PiNetwork from '@pinetwork-js/api-backend';
+import axios from 'axios';
 
 // ============================================================
 // CONFIG
 // ============================================================
+const PI_BASE_URL = 'https://api.minepi.com/v2';
 const IS_MAINNET = process.env.PI_NETWORK === 'mainnet';
-
-const PAYMENT_CONFIG = {
-  amount: 0.1,
-  memo: 'A2U Testnet Completion',
-  metadata: { type: 'checklist_10_10' },
-  network: IS_MAINNET ? 'mainnet' : 'pi_testnet',
-};
+const NETWORK = IS_MAINNET ? 'Pi Network' : 'Pi Testnet';
 
 // ============================================================
 // KNOWN PI ERROR MESSAGES
 // ============================================================
 const PI_ERROR_MESSAGES: Record<string, string> = {
-  user_not_found: 'User not found on the Pi Network.',
-  insufficient_funds: 'Wallet has insufficient funds.',
-  payment_already_exists: 'This payment has already been processed.',
-  invalid_uid: 'Invalid user identifier.',
+  payment_not_found: 'Payment not found on the Pi Network.',
+  payment_already_completed: 'This payment has already been completed.',
+  unauthorized: 'API key is invalid or unauthorized.',
   network_error: 'Network error, please try again.',
 };
 
@@ -29,14 +23,14 @@ const PI_ERROR_MESSAGES: Record<string, string> = {
 // ============================================================
 const rateLimitMap = new Map<string, { count: number; startTime: number }>();
 const RATE_LIMIT_WINDOW_MS = 60 * 1000; // 1 minute
-const RATE_LIMIT_MAX_REQUESTS = 3;       // 3 requests per UID
+const RATE_LIMIT_MAX_REQUESTS = 5;      // 5 requests per paymentId
 
-function isRateLimited(uid: string): boolean {
+function isRateLimited(key: string): boolean {
   const now = Date.now();
-  const record = rateLimitMap.get(uid);
+  const record = rateLimitMap.get(key);
 
   if (!record || now - record.startTime > RATE_LIMIT_WINDOW_MS) {
-    rateLimitMap.set(uid, { count: 1, startTime: now });
+    rateLimitMap.set(key, { count: 1, startTime: now });
     return false;
   }
 
@@ -47,59 +41,50 @@ function isRateLimited(uid: string): boolean {
 }
 
 // ============================================================
-// INIT PI SDK - Once on module load
+// IN-MEMORY DOUBLE-COMPLETE GUARD
 // ============================================================
-let pi: any;
-try {
-  if (!process.env.PI_APP_WALLET_SEED) {
-    throw new Error('PI_APP_WALLET_SEED is missing from .env');
-  }
-  if (IS_MAINNET && !process.env.PI_API_KEY_MAINNET) {
-    throw new Error('PI_API_KEY_MAINNET is missing from .env');
-  }
-  if (!IS_MAINNET && !process.env.PI_API_KEY_TESTNET) {
-    throw new Error('PI_API_KEY_TESTNET is missing from .env');
-  }
+const completedPayments = new Map<string, string>();
 
-  pi = new PiNetwork(
-    IS_MAINNET ? process.env.PI_API_KEY_MAINNET : process.env.PI_API_KEY_TESTNET,
-    process.env.PI_APP_WALLET_SEED,
-    IS_MAINNET ? 'mainnet' : 'pi_testnet'
+// ============================================================
+// VALIDATE API KEY ON STARTUP
+// ============================================================
+const API_KEY = IS_MAINNET
+  ? process.env.PI_API_KEY_MAINNET
+  : process.env.PI_API_KEY_TESTNET;
+
+if (!API_KEY) {
+  console.error(
+    `[complete-payment] Missing ${IS_MAINNET ? 'PI_API_KEY_MAINNET' : 'PI_API_KEY_TESTNET'} in .env`
   );
-
-  console.log(`[Pi SDK] Initialized on ${PAYMENT_CONFIG.network}`);
-} catch (initError: any) {
-  console.error('[Pi SDK] Initialization failed:', initError.message);
 }
 
 // ============================================================
 // HELPER - Resolve a friendly error message
 // ============================================================
 function resolveErrorMessage(error: any): string {
+  const piError = error.response?.data?.error_code || error.response?.data?.message || '';
   const errorKey = Object.keys(PI_ERROR_MESSAGES).find(
     (key) =>
-      error?.code === key ||
+      piError?.toLowerCase().includes(key.toLowerCase()) ||
       error?.message?.toLowerCase().includes(key.toLowerCase())
   );
   return errorKey
     ? PI_ERROR_MESSAGES[errorKey]
-    : error?.message || 'An unexpected error occurred.';
+    : error.response?.data?.message || error.message || 'An unexpected error occurred.';
 }
 
 // ============================================================
-// HELPER - Log transaction (replace with DB call in Production)
+// HELPER - Log transaction
 // ============================================================
-async function logTransaction(data: {
-  uid: string;
-  paymentId: string | null;
-  txid: string | null;
+function logTransaction(data: {
+  paymentId: string;
+  txid?: string;
   status: string;
   error?: string;
-}): Promise<void> {
-  // Example: await db.transactions.create({ ...data, createdAt: new Date() });
+}): void {
   console.log('[Transaction Log]', {
     ...data,
-    network: PAYMENT_CONFIG.network,
+    network: NETWORK,
     timestamp: new Date().toISOString(),
   });
 }
@@ -108,87 +93,86 @@ async function logTransaction(data: {
 // MAIN HANDLER
 // ============================================================
 export default async function handler(req: VercelRequest, res: VercelResponse) {
+
   // 1. Method check
   if (req.method !== 'POST') {
     return res.status(405).json({ error: 'Method Not Allowed' });
   }
 
-  // 2. SDK guard
-  if (!pi) {
-    return res.status(500).json({ error: 'Pi SDK is not initialized.' });
+  // 2. API key guard
+  if (!API_KEY) {
+    return res.status(500).json({ error: 'API key not configured for this network.' });
   }
 
-  // 3. Validate UID
-  const { uid } = req.body ?? {};
+  // 3. Validate body
+  const { paymentId, txid } = req.body ?? {};
 
-  if (!uid || typeof uid !== 'string' || uid.trim() === '') {
-    console.error('[Backend] Error: UID is missing or invalid.');
-    return res.status(400).json({ error: 'invalid_uid', message: 'User UID is required.' });
+  if (!paymentId || typeof paymentId !== 'string' || paymentId.trim() === '') {
+    return res.status(400).json({ error: 'Missing or invalid paymentId.' });
   }
 
-  const sanitizedUid = uid.trim();
+  if (!txid || typeof txid !== 'string' || txid.trim() === '') {
+    return res.status(400).json({ error: 'Missing or invalid txid.' });
+  }
+
+  const sanitizedPaymentId = paymentId.trim();
+  const sanitizedTxid = txid.trim();
 
   // 4. Rate limiting
-  if (isRateLimited(sanitizedUid)) {
-    console.warn(`[Backend] Rate limit exceeded for UID: ${sanitizedUid}`);
+  if (isRateLimited(sanitizedPaymentId)) {
+    console.warn(`[complete-payment] Rate limit exceeded for paymentId: ${sanitizedPaymentId}`);
     return res.status(429).json({
-      error: 'rate_limit_exceeded',
-      message: 'Too many requests. Please wait a minute and try again.',
+      error: 'Too many requests. Please wait a minute and try again.',
     });
   }
 
-  let paymentId: string | null = null;
+  // 5. Double-complete guard
+  const existingTxid = completedPayments.get(sanitizedPaymentId);
+  if (existingTxid) {
+    console.warn(`[complete-payment] Double-complete attempt for paymentId: ${sanitizedPaymentId}`);
+    return res.status(409).json({
+      error: 'Payment already completed.',
+      txid: existingTxid,
+    });
+  }
 
   try {
-    console.log(`[Backend] Initiating A2U payment for UID: ${sanitizedUid}`);
+    console.log(`[complete-payment] Completing paymentId: ${sanitizedPaymentId} | TXID: ${sanitizedTxid}`);
 
-    // 5. Create the payment
-    paymentId = await pi.createPayment({
-      amount: PAYMENT_CONFIG.amount,
-      memo: PAYMENT_CONFIG.memo,
-      metadata: PAYMENT_CONFIG.metadata,
-      uid: sanitizedUid,
-    });
+    // 6. Send complete request to Pi Network
+    const response = await axios.post(
+      `${PI_BASE_URL}/payments/${sanitizedPaymentId}/complete`,
+      { txid: sanitizedTxid },
+      { headers: { Authorization: `Key ${API_KEY}` } }
+    );
 
-    if (!paymentId) throw new Error('Payment creation failed. No paymentId received.');
-    console.log(`[Backend] Payment created. PaymentID: ${paymentId}`);
-
-    // 6. Submit to blockchain
-    const txid: string = await pi.submitPayment(paymentId);
-    if (!txid) throw new Error('Payment submission failed. No TXID received.');
-    console.log(`[Backend] Payment submitted to blockchain. TXID: ${txid}`);
-
-    // 7. Complete payment on Pi servers
-    await pi.completePayment(paymentId, txid);
-    console.log(`[Backend] Payment completed successfully. TXID: ${txid}`);
-
-    // 8. Log successful transaction
-    await logTransaction({ uid: sanitizedUid, paymentId, txid, status: 'completed' });
+    // 7. Update guard & log
+    completedPayments.set(sanitizedPaymentId, sanitizedTxid);
+    logTransaction({ paymentId: sanitizedPaymentId, txid: sanitizedTxid, status: 'completed' });
 
     return res.status(200).json({
       success: true,
-      txid,
-      paymentId,
+      txid: sanitizedTxid,
       message: 'Payment completed successfully.',
     });
 
   } catch (error: any) {
-    console.error(`[Backend] Error processing payment for UID ${sanitizedUid}:`, error.message);
+    const statusCode = error.response?.status ?? 500;
+    const friendlyMessage = resolveErrorMessage(error);
 
-    await logTransaction({
-      uid: sanitizedUid,
-      paymentId,
-      txid: null,
+    console.error('[complete-payment] Error:', error.response?.data || error.message);
+
+    logTransaction({
+      paymentId: sanitizedPaymentId,
+      txid: sanitizedTxid,
       status: 'failed',
       error: error.message,
     });
 
-    const friendlyMessage = resolveErrorMessage(error);
-
-    return res.status(500).json({
-      error: 'payment_failed',
+    return res.status(statusCode).json({
+      error: 'Failed to complete payment.',
       message: friendlyMessage,
-      ...(process.env.NODE_ENV === 'development' && { debug: error.message }),
+      ...(process.env.NODE_ENV === 'development' && { debug: error.response?.data || error.message }),
     });
   }
 }
