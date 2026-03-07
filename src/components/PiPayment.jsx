@@ -10,7 +10,9 @@ const API_ENDPOINTS = {
 // ============================================================
 // CONSTANTS
 // ============================================================
+const PI_SCOPES = ['payments', 'username'];
 const PAYMENT_AMOUNT = 0.1;
+const IS_SANDBOX = import.meta.env.VITE_PI_SANDBOX !== 'false';
 
 const STATUS_TYPES = {
   IDLE: 'idle',
@@ -150,7 +152,7 @@ export default function PiPayment() {
       }
 
       try {
-        window.Pi.init({ version: '2.0', sandbox: true });
+        window.Pi.init({ version: '2.0', sandbox: IS_SANDBOX });
 
         const auth = await window.Pi.authenticate(
           PI_SCOPES,
